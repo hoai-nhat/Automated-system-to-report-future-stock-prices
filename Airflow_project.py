@@ -8,7 +8,6 @@ import pandas as pd
 import numpy as np
 import ssl
 import os
-import sys
 
 #cung cấp quyền truy cập đến http
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -35,6 +34,7 @@ def craw_stock_price(**kwargs):
     #chạy hàng ngày
     to_day = kwargs["to_date"]
     df = vnstock.stock_historical_data(symbol=CK, start_date="2000-01-01", end_date=to_day)
+    df = df.astype({"Open":'int',"High":'int',"Low":'int',"Close":'int'})
     df.to_csv("/home/airflow/VCB.csv", index=None , header='true')
     return True
 #đưa dữ liệu lên database để lưu trữ
@@ -58,25 +58,30 @@ def train_model():
     from tensorflow.keras.layers import Dense, Dropout, LSTM
     import matplotlib.pyplot as plt
     from sklearn.preprocessing import MinMaxScaler
+    from sqlalchemy import create_engine
+    import psycopg2
 
-    #đọc dữ liệu
-    df=pd.read_csv("/home/airflow/VCB.csv")
-
+    #connect database
+    alchemyEngine = create_engine("postgresql+psycopg2://airflow:airflow@host.docker.internal:5432/stock")
+    dbConnection = alchemyEngine.connect() 
+    #df=pd.read_csv("/home/airflow/VCB.csv")
+    sql = "select * FROM VCB"
+    df = pd.read_sql(sql,dbConnection)
     #tạo thêm dữ liệu để phân tích
     #Khoản giữa của giá cao nhất và giá thấp nhất (mô hình cây nến)
-    df['H-L'] = df['High'] - df['Low']
+    df['H-L'] = df['high'] - df['low']
     #Khoản giữa của giá mở cữa và giá đóng cửa
-    df['O-C'] = df['Open'] - df['Close']
+    df['O-C'] = df['open'] - df['close']
     #giá trị trung bình lần lượt 7 ngày , 14 ngày , 21 ngày
     ma_1 = 7
     ma_2 = 14
     ma_3 = 21
-    df[f'SMA_{ma_1}'] = df['Close'].rolling(window=ma_1).mean()
-    df[f'SMA_{ma_2}'] = df['Close'].rolling(window=ma_2).mean()
-    df[f'SMA_{ma_3}'] = df['Close'].rolling(window=ma_3).mean()
+    df[f'SMA_{ma_1}'] = df['close'].rolling(window=ma_1).mean()
+    df[f'SMA_{ma_2}'] = df['close'].rolling(window=ma_2).mean()
+    df[f'SMA_{ma_3}'] = df['close'].rolling(window=ma_3).mean()
 
-    df[f'SD_{ma_1}'] = df['Close'].rolling(window=ma_1).std()
-    df[f'SD_{ma_3}'] = df['Close'].rolling(window=ma_3).std()
+    df[f'SD_{ma_1}'] = df['close'].rolling(window=ma_1).std()
+    df[f'SD_{ma_3}'] = df['close'].rolling(window=ma_3).std()
     #xoá giá trị not a number trong moving average
     df.dropna(inplace=True)
 
@@ -87,7 +92,7 @@ def train_model():
     scala_y = MinMaxScaler(feature_range=(0, 1))
     #là những giá trị để dự đoán những ngày tiếp theo
     cols_x = ['H-L', 'O-C', f'SMA_{ma_1}', f'SMA_{ma_2}', f'SMA_{ma_3}', f'SD_{ma_1}', f'SD_{ma_3}']
-    cols_y = ['Close']
+    cols_y = ['close']
     scaled_data_x = scala_x.fit_transform(df[cols_x].values.reshape(-1, len(cols_x)))
     scaled_data_y = scala_y.fit_transform(df[cols_y].values.reshape(-1, len(cols_y)))
 
@@ -103,11 +108,11 @@ def train_model():
     #số ngày test 
     test_size = 365
     
-    #tách data thành 2 phần : 1 phần để train ; 1 phần để test
+    #tách data thành 2 phần : 1 phần để train ; 1 phần để dự đoán
     x_train = np.array(x_total[:len(x_total)-test_size])
-    x_test = np.array(x_total[len(x_total)-test_size:])
     y_train = np.array(y_total[:len(y_total)-test_size])
-    y_test = np.array(y_total[len(y_total)-test_size:])
+
+    x_du_doan = np.array(x_total[len(x_total)-test_size:])
 
     #buil model
     #tạo lớp mạng cho dữ liệu đầu vào
@@ -134,12 +139,12 @@ def train_model():
     model.save("/home/airflow/VCB.h5")
     
     #dự đoán cho dữ liệu train
-    predict_prices = model.predict(x_test)
+    predict_prices = model.predict(x_du_doan)
     #đưa về giá trị gốc 
     predict_prices = scala_y.inverse_transform(predict_prices)
 
     #xữ lý giá thực
-    real_price = df[len(df)-test_size:]['Close'].values.reshape(-1, 1)
+    real_price = df[len(df)-test_size:]['close'].values.reshape(-1, 1)
     real_price = np.array(real_price)
     real_price = real_price.reshape(real_price.shape[0], 1)
 
@@ -196,8 +201,6 @@ dag = DAG(
     default_args={
         'email': ['hoainhat8866@gmail.com'],
         'email_on_failure': True,
-        'retries': 1,
-        'retry_delay': timedelta(minutes=5),
     },
     description='Stock futures',
     schedule=timedelta(days=1),
@@ -239,12 +242,12 @@ create_table_postgres_task = PostgresOperator(
     sql=r"""
     DROP TABLE IF EXISTS VCB;
     CREATE TABLE if not exists VCB (
-        Open varchar(10),
-        High varchar(10),
-        Low varchar(10),
-        Close varchar(10),
-        Volume varchar(10),
-        TradingDate varchar(20)
+        Open INT,
+        High INT,
+        Low INT,
+        Close INT,
+        Volume INT,
+        TradingDate varchar(20) PRIMARY KEY
     );
     """,
     dag=dag
